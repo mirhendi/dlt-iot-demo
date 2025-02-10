@@ -33,7 +33,7 @@ def transformed_streams():
     df = df.withColumn("reading_hour", f.hour(f.col("reading_timestamp")))
     return df
 
-dlt.create_streaming_table(name="iot_scd", partition_cols=["reading_date"], table_properties={"delta.enableDeletionVectors":"true"})
+dlt.create_streaming_table(name="iot_scd", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols":"reading_hour, reading_timestamp, meter_id"})
 dlt.apply_changes(
     target="iot_scd",  # The customer table being materilized
     source="transformed_streams",  # the incoming CDC
@@ -47,36 +47,67 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
-@dlt.table(name="voltage_factor")
+@dlt.view(name="voltage_scd")
 def meter_voltage_dlt():
     df = spark.read.table("sadra.hq.meter_voltage")
-    df = df.withColumn("starting_date", f.col("starting_timestamp").cast("date"))
-    df = df.withColumn("ending_date", f.col("ending_timestamp").cast("date"))
     return df
 
-@dlt.table(name="topology")
+#dlt.create_streaming_table(name="voltage_scd", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols":"meter_id"})
+#dlt.apply_changes_from_snapshot(
+#    target="voltage_scd",  # The customer table being materilized
+#    source="voltage_factor",  # the incoming CDC
+#    keys=["reading_date", "meter_id"],  # what we'll be using to match the rows to upsert
+#)
+
+#@dlt.table(name="topology", table_properties={"pipelines.autoOptimize.zOrderCols":"reading_date, meter_id"})
+#def meter_topology_dlt():
+#    df = spark.read.table("sadra.hq.meter_topology")
+#    return df
+
+#dlt.create_streaming_table(name="topology_scd", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols":"meter_id"})
+#dlt.apply_changes_from_snapshot(
+#    target="topology_scd",  # The customer table being materilized
+#    source="topology",  # the incoming CDC
+#    keys=["reading_date", "meter_id"],  # what we'll be using to match the rows to upsert
+#)
+
+
+# COMMAND ----------
+
+@dlt.table(name="topology", table_properties={"pipelines.autoOptimize.zOrderCols":"meter_id"})
 def meter_topology_dlt():
     df = spark.read.table("sadra.hq.meter_topology")
     df = df.withColumn("starting_date", f.col("starting_timestamp").cast("date"))
     df = df.withColumn("ending_date", f.col("ending_timestamp").cast("date"))
     return df
 
+dlt.create_streaming_table(name="topology_scd", table_properties={"pipelines.autoOptimize.zOrderCols":"meter_id, starting_date, ending_date"})
+dlt.apply_changes_from_snapshot(
+    target="topology_scd",  # The customer table being materilized
+    source="topology",  # the incoming CDC
+    keys=["meter_id", "starting_date", "ending_date", "starting_timestamp", "ending_timestamp"],  # what we'll be using to match the rows to upsert
+)
+
+
+# COMMAND ----------
+
 @dlt.table(name="iot_scd_joined", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols":"reading_hour, reading_timestamp, meter_id, region"})
 def iot_data_joined():
     df = dlt.read("iot_scd")
-    voltage_multiplier = dlt.read("voltage_factor")
+    voltage_multiplier = dlt.read("voltage_scd")
     df = df.join(voltage_multiplier, (df.meter_id == voltage_multiplier.meter_id) & 
-                 (df.reading_date.between(voltage_multiplier.starting_date, voltage_multiplier.ending_date)) &
-                 (df.reading_timestamp.between(voltage_multiplier.starting_timestamp , voltage_multiplier.ending_timestamp)), "left_outer")\
-        .drop(*[voltage_multiplier.meter_id, voltage_multiplier.starting_timestamp, voltage_multiplier.ending_timestamp, voltage_multiplier.starting_date, voltage_multiplier.ending_date])
+                 (df.reading_date == voltage_multiplier.reading_date) , "left_outer")\
+        .drop(*[voltage_multiplier.meter_id, voltage_multiplier.reading_date])
     df = df.withColumn("reading_value_multiplier", f.col("reading_value") * f.col("voltage_multiplier"))
+    df = df.withColumn("reading_value_3", f.col("reading_value") * 3)        
+    topology = dlt.read("topology_scd")
+    df = df.join(topology, (df.meter_id == topology.meter_id) & \
+            (df.reading_date >= topology.starting_date) & \
+            (df.reading_date <= topology.ending_date) & \
+            (df.reading_timestamp >= topology.starting_timestamp) & \
+            (df.reading_timestamp < topology.ending_timestamp), \
+            "left_outer").drop(*[topology.meter_id, topology.starting_timestamp, topology.ending_timestamp, topology.starting_date, topology.ending_date])
 
-    topology = dlt.read("topology")
-    df = df.join(topology, (df.meter_id == topology.meter_id) & 
-                (df.reading_date.between(topology.starting_date, topology.ending_date)) &
-                (df.reading_timestamp.between(topology.starting_timestamp , topology.ending_timestamp)), "left_outer") \
-        .drop(*[topology.meter_id, topology.starting_timestamp, topology.ending_timestamp, topology.starting_date, topology.ending_date])
-        
     return df
 
 @dlt.table(name="iot_hour", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols":"reading_hour, meter_id"})
@@ -84,7 +115,6 @@ def iot_hour():
     df = dlt.read("iot_scd_joined")
     df = df.groupBy("reading_date", "meter_id", "reading_hour").agg(f.sum("reading_value").alias("reading_value_sum_hour"), 
                                                                     f.sum("reading_value_multiplier").alias("reading_value_multiplier_sum_hour"))
-
     return df
 
 @dlt.table(name="iot_day", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols": "meter_id"})
@@ -92,7 +122,6 @@ def iot_day():
     df = dlt.read("iot_scd_joined")
     df = df.groupBy("reading_date", "meter_id").agg(f.sum("reading_value").alias("reading_value_sum_day"),
                                                     f.sum("reading_value_multiplier").alias("reading_value_multiplier_sum_day"))
-
     return df
 
 @dlt.table(name="iot_region", partition_cols=["reading_date"], table_properties={"pipelines.autoOptimize.zOrderCols": "reading_timestamp, region"})
@@ -101,5 +130,4 @@ def iot_region():
     df = df.groupBy("reading_date", "reading_timestamp", "region").agg(f.sum("reading_value").alias("reading_value_sum_region"),
                                                        f.sum("reading_value_multiplier").alias("reading_value_multiplier_sum_region"))
     return df
-
 

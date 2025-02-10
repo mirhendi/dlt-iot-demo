@@ -9,9 +9,10 @@ from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType, 
 from datetime import datetime, timedelta
 import time
 import random
+import pyspark.sql.functions as f
 
 # Parameters
-num_meters = 6000  # Total meters
+num_meters = 5000000  # Total meters
 start_time = datetime(2024, 1, 1)
 end_time = datetime(2025, 1, 1)
 
@@ -32,13 +33,13 @@ def simulate_iot_data(table_name):
     if spark.catalog.tableExists(f"sadra.hq.{table_name}"): # First time:
         iot_hydro_data_set_1 = spark.read.table(f"sadra.hq.{table_name}")
         last_reading_timestamp = spark.sql(f"SELECT max(reading_timestamp) FROM sadra.hq.{table_name}").collect()[0][0]
-        df_duplicates = iot_hydro_data_set_1.limit(100) # Add duplicates 
+        df_duplicates = iot_hydro_data_set_1.limit(100) # Add corrections
     else:
         last_reading_timestamp = start_time
         df_duplicates = None
-    
-    current_time = last_reading_timestamp + timedelta(days=1)
 
+    current_time = last_reading_timestamp + timedelta(hours=12)
+    print(last_reading_timestamp, current_time)
     # Generate a DataFrame with the current batch of timestamps
     df_timestamps = spark.sql(f"""
         SELECT explode(sequence(
@@ -50,6 +51,7 @@ def simulate_iot_data(table_name):
 
     # Cross join meters and timestamps to create the base dataset
     df_base = df_meters.crossJoin(df_timestamps)
+    df_base = df_base.union(df_base).union(df_base).union(df_base)
 
     # Add random reading values and arrival timestamps
     df_data = df_base \
@@ -57,75 +59,141 @@ def simulate_iot_data(table_name):
         .withColumn("reading_type", random_choice_udf()) \
         .withColumn("arrival_timestamp", lit(current_time))
 
-    
-    if df_duplicates is not None:    
+    if df_duplicates is not None:
         df_duplicates = df_duplicates \
             .withColumn("reading_value", round(rand() * (500.0 - 10.0) + 10.0, 2)) \
             .withColumn("reading_type", random_choice_udf()) \
-            .withColumn("arrival_timestamp", lit(current_time)) 
+            .withColumn("arrival_timestamp", lit(current_time))
 
         # Union the original and duplicate DataFrames
         df_final = df_data.union(df_duplicates)
-
+        #df_final = df_data
     else:
         df_final = df_data
-    
+    display(df_final.select("reading_timestamp").distinct())
     # Append the current batch to the final table
     df_final.write.mode("append").saveAsTable(f"sadra.hq.{table_name}")
 
 
 # COMMAND ----------
 
-while True:
-  simulate_iot_data("iot_source_1")
-  #simulate_iot_data("iot_source_2")
-  #simulate_iot_data("iot_source_3")
-  time.sleep(10)
+simulate_iot_data("iot_source_1")
+simulate_iot_data("iot_source_2")
+simulate_iot_data("iot_source_3")
+
 
 # COMMAND ----------
 
-display(spark.read.table("sadra.hq.iot_source_1"))
+while True:
+  simulate_iot_data("iot_source_1")
+  time.sleep(300)
+#simulate_iot_data("iot_source_2")
+#simulate_iot_data("iot_source_3")
+
+
+# COMMAND ----------
+
+df = spark.read.table("sadra.hq.iot_source_1")
+print(df.count()/1000000, "Milion rows")
+display(df.limit(10))
+
+# COMMAND ----------
+
+spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_voltage")
+
+# Create voltage table with specified schema and set table properties
+spark.sql("""
+CREATE TABLE sadra.hq.meter_voltage (
+    meter_id LONG,
+    voltage_multiplier INT,
+    reading_date DATE
+)
+PARTITIONED BY (reading_date)
+TBLPROPERTIES (
+    delta.enableChangeDataFeed = true,
+    delta.enableRowTracking = true,
+    delta.enableDeletionVectors = true)
+""")
 
 # COMMAND ----------
 
 
 def simulate_voltage_update():
-  if not spark.catalog.tableExists("sadra.hq.meter_voltage"): # First time
+  df = spark.read.table("sadra.hq.meter_voltage")
+  if df.count() == 0: # First time
     # Generate timestamps every three months
-    data = []
-    current_start = start_time
-    while current_start < end_time:
-        current_end = current_start + timedelta(days=5)  # Approximation of three months
-        data.append((current_start, current_end))
-        current_start = current_end
 
-    # Define schema
-    schema = StructType([
-        StructField("starting_timestamp", TimestampType(), True),
-        StructField("ending_timestamp", TimestampType(), True)
-    ])
-
-    # Create DataFrame
-    df_timestamps = spark.createDataFrame(data, schema)
+    df_timestamps = spark.sql(f"""
+        SELECT explode(sequence(
+            to_date('{start_time.strftime('%Y-%m-%d')}'),
+            to_date('{end_time.strftime('%Y-%m-%d')}'),
+            interval 1 day
+        )) as reading_date
+    """)
     df_voltage = df_meters.crossJoin(df_timestamps)
     df_voltage = df_voltage.withColumn("voltage_multiplier", (rand() * 3 + 1).cast(IntegerType()))
-    df_voltage.write.saveAsTable("sadra.hq.meter_voltage")    
+    df_voltage.write.mode("append").saveAsTable("sadra.hq.meter_voltage")
+    display(df_voltage)
+
   else: #Updates
-    df_voltage = spark.read.table("sadra.hq.meter_voltage")  
-    fractions = [1 / df_voltage.count(), 1 - (10 / df_voltage.count())]  # Proportion for splitting
-    df_voltage_update, df_voltage_no_update = df_voltage.randomSplit(fractions, seed=42)
+    df_voltage = spark.read.table("sadra.hq.meter_voltage")
+
+    # Select a row to update
+    df_voltage_update = df_voltage.orderBy(rand()).limit(1)
     df_voltage_update = df_voltage_update.withColumn("voltage_multiplier", (rand() * 3 + 1).cast(IntegerType()))
     display(df_voltage_update)
-    df_voltage = df_voltage_update.union(df_voltage_no_update)
-    df_voltage.write.mode('overwrite').saveAsTable("sadra.hq.meter_voltage")
+    # Create a temporary view for the row to update
+    df_voltage_update.createOrReplaceTempView("df_voltage_update")
+
+    # Merge the updated row back into the delta table
+    spark.sql("""
+    MERGE INTO sadra.hq.meter_voltage AS target
+    USING df_voltage_update AS source
+    ON target.meter_id = source.meter_id 
+    AND target.reading_date = source.reading_date 
+    WHEN MATCHED THEN
+      UPDATE SET target.voltage_multiplier = source.voltage_multiplier
+    """)
 
 simulate_voltage_update()
+
+# COMMAND ----------
+
+spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_topology")
 
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC DROP TABLE sadra.hq.meter_voltage
+# def simulate_toplogy_update():
+#   value_list = ["Montreal", "Quebec City", "Laval", "Gatineau", "Longueuil"]  # Quebec city names
+#   random_choice_udf = udf(lambda: random.choice(value_list), StringType())
+
+#   if not spark.catalog.tableExists("sadra.hq.meter_topology"): # First time       
+#     df_timestamps = spark.sql(f"""
+#         SELECT explode(sequence(
+#             to_date('{start_time.strftime('%Y-%m-%d')}'),
+#             to_date('{end_time.strftime('%Y-%m-%d')}'),
+#             interval 180 day
+#         )) as reading_date
+#     """)
+    
+#     df_topology = df_meters.crossJoin(df_timestamps)
+    
+#     # Create a UDF to select a random value from the list
+#     df_topology = df_topology.withColumn("region", random_choice_udf())
+#     df_topology.write.saveAsTable("sadra.hq.meter_topology")
+#     display(df_topology)
+#   else: #Updates
+#     df_topology = spark.read.table("sadra.hq.meter_topology")  
+#     df_topology_update = df_topology.orderBy(rand()).limit(2)
+#     df_topology_no_update = df_topology.subtract(df_topology_update)
+#     df_topology_update = df_topology_update.withColumn("region", random_choice_udf())
+#     display(df_topology_update)
+#     df_topology = df_topology_update.union(df_topology_no_update)
+#     df_topology.write.mode('overwrite').saveAsTable("sadra.hq.meter_topology")
+
+# simulate_toplogy_update()
+
 
 # COMMAND ----------
 
@@ -150,20 +218,28 @@ def simulate_toplogy_update():
 
     # Create DataFrame
     df_timestamps = spark.createDataFrame(data, schema)
-    df_topology = df_meters.crossJoin(df_timestamps)
-    
+    df = df_meters.crossJoin(df_timestamps)
+
     # Create a UDF to select a random value from the list
-    df_topology = df_topology.withColumn("region", random_choice_udf())
-    df_topology.write.saveAsTable("sadra.hq.meter_topology")
-    
+    df = df.withColumn("region", random_choice_udf())
+    df = df.withColumn("update_timestamp", f.current_timestamp())
+    display(df)
+    df.write.saveAsTable("sadra.hq.meter_topology")
+
   else: #Updates
-    df_topology = spark.read.table("sadra.hq.meter_topology")  
-    fractions = [1 / df_topology.count(), 1 - (10 / df_topology.count())]  # Proportion for splitting
-    df_topology_update, df_topology_no_update = df_topology.randomSplit(fractions, seed=42)
-    df_topology_update = df_topology_update.withColumn("region", random_choice_udf())
-    display(df_topology_update)
-    df_topology = df_topology_update.union(df_topology_no_update)
-    df_topology.write.mode('overwrite').saveAsTable("sadra.hq.meter_topology")
+    df = spark.read.table("sadra.hq.meter_topology")  
+    df_update = df.orderBy(rand()).limit(2)
+    df_no_update = df.subtract(df_update)
+
+    # Split each updated row into two rows
+    df_update_1 = df_update.withColumn("ending_timestamp", col("starting_timestamp") + expr("INTERVAL 2 DAYS"))
+    df_update_2 = df_update.withColumn("starting_timestamp", col("starting_timestamp") + expr("INTERVAL 2 DAYS"))
+    df_update = df_update_1.union(df_update_2)
+    df_update = df_update.withColumn("region", random_choice_udf())
+    df_update = df_update.withColumn("update_timestamp", f.current_timestamp())
+    display(df_update)
+    df = df_update.union(df_no_update)
+    df.write.mode('overwrite').saveAsTable("sadra.hq.meter_topology")
 
 simulate_toplogy_update()
 
