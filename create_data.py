@@ -1,6 +1,28 @@
 # Databricks notebook source
-spark.sql("DROP SCHEMA IF EXISTS sadra.hq CASCADE")
-spark.sql("CREATE SCHEMA IF NOT EXISTS sadra.hq")
+first_time = False
+if first_time:
+  spark.sql("DROP SCHEMA IF EXISTS sadra.hq CASCADE")
+  spark.sql("CREATE SCHEMA IF NOT EXISTS sadra.hq")
+
+  spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_voltage")
+
+  # Create voltage table with specified schema and set table properties
+  spark.sql("""
+  CREATE TABLE sadra.hq.meter_voltage (
+      meter_id LONG,
+      voltage_multiplier INT,
+      reading_date DATE
+  )
+  PARTITIONED BY (reading_date)
+  TBLPROPERTIES (
+      delta.enableChangeDataFeed = true,
+      delta.enableRowTracking = true,
+      delta.enableDeletionVectors = true)
+  """)
+
+  spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_topology")
+
+
 
 # COMMAND ----------
 
@@ -11,7 +33,7 @@ import time
 import random
 import pyspark.sql.functions as f
 
-# Parameters
+# Parameters0
 num_meters = 5000000  # Total meters
 start_time = datetime(2024, 1, 1)
 end_time = datetime(2025, 1, 1)
@@ -78,17 +100,12 @@ def simulate_iot_data(table_name):
 # COMMAND ----------
 
 simulate_iot_data("iot_source_1")
-simulate_iot_data("iot_source_2")
-simulate_iot_data("iot_source_3")
-
-
-# COMMAND ----------
-
-while True:
-  simulate_iot_data("iot_source_1")
-  time.sleep(300)
 #simulate_iot_data("iot_source_2")
 #simulate_iot_data("iot_source_3")
+
+#while True:
+#  simulate_iot_data("iot_source_1")
+#  time.sleep(300)
 
 
 # COMMAND ----------
@@ -96,24 +113,6 @@ while True:
 df = spark.read.table("sadra.hq.iot_source_1")
 print(df.count()/1000000, "Milion rows")
 display(df.limit(10))
-
-# COMMAND ----------
-
-spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_voltage")
-
-# Create voltage table with specified schema and set table properties
-spark.sql("""
-CREATE TABLE sadra.hq.meter_voltage (
-    meter_id LONG,
-    voltage_multiplier INT,
-    reading_date DATE
-)
-PARTITIONED BY (reading_date)
-TBLPROPERTIES (
-    delta.enableChangeDataFeed = true,
-    delta.enableRowTracking = true,
-    delta.enableDeletionVectors = true)
-""")
 
 # COMMAND ----------
 
@@ -156,44 +155,6 @@ def simulate_voltage_update():
     """)
 
 simulate_voltage_update()
-
-# COMMAND ----------
-
-spark.sql("DROP TABLE IF EXISTS sadra.hq.meter_topology")
-
-
-# COMMAND ----------
-
-# def simulate_toplogy_update():
-#   value_list = ["Montreal", "Quebec City", "Laval", "Gatineau", "Longueuil"]  # Quebec city names
-#   random_choice_udf = udf(lambda: random.choice(value_list), StringType())
-
-#   if not spark.catalog.tableExists("sadra.hq.meter_topology"): # First time       
-#     df_timestamps = spark.sql(f"""
-#         SELECT explode(sequence(
-#             to_date('{start_time.strftime('%Y-%m-%d')}'),
-#             to_date('{end_time.strftime('%Y-%m-%d')}'),
-#             interval 180 day
-#         )) as reading_date
-#     """)
-    
-#     df_topology = df_meters.crossJoin(df_timestamps)
-    
-#     # Create a UDF to select a random value from the list
-#     df_topology = df_topology.withColumn("region", random_choice_udf())
-#     df_topology.write.saveAsTable("sadra.hq.meter_topology")
-#     display(df_topology)
-#   else: #Updates
-#     df_topology = spark.read.table("sadra.hq.meter_topology")  
-#     df_topology_update = df_topology.orderBy(rand()).limit(2)
-#     df_topology_no_update = df_topology.subtract(df_topology_update)
-#     df_topology_update = df_topology_update.withColumn("region", random_choice_udf())
-#     display(df_topology_update)
-#     df_topology = df_topology_update.union(df_topology_no_update)
-#     df_topology.write.mode('overwrite').saveAsTable("sadra.hq.meter_topology")
-
-# simulate_toplogy_update()
-
 
 # COMMAND ----------
 
